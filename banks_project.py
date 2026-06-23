@@ -8,7 +8,6 @@ import numpy as np
 import requests 
 import sqlite3
 from datetime import datetime
-from bs4 import BeautifulSoup 
 
 # Project Configuration - Live Wikipedia Source
 #===============================================================
@@ -34,54 +33,56 @@ def log_progress(message):
         f.write(timestamp + ' : ' + message + '\n')
 
 #===========================================
-# Task 2: Data Extraction (Live & Robust)
+# Task 2: Data Extraction (Safe & Bulletproof)
 # ==========================================
 def extract(url, table_attribs):
-    ''' Extracts live web data from Wikipedia and sanitizes numeric anomalies. '''
-    # Spoofing User-Agent to prevent HTTP 403 Forbidden errors from Wikipedia
+    ''' Extracts live web data from Wikipedia using Pandas read_html to prevent HTML index shifting. '''
     headers = {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:151.0) Gecko/20100101 Firefox/151.0'  
     }
-    df = pd.DataFrame(columns = table_attribs)
     
     try:
-        # Requesting web content with a strict 15-second timeout threshold
         response = requests.get(url, headers=headers, timeout=15)
-        
         if response.status_code == 200:
-            data = BeautifulSoup(response.text, 'html.parser')
-            # Isolating the primary dynamic wikitable target
-            target_table = data.find('table', {'class': 'wikitable'})
-            rows = target_table.find_all('tr')
+            # Pandas automatic HTML table parser
+            all_tables = pd.read_html(response.text)
             
-            for row in rows: 
-                col = row.find_all('td')
-                if len(col) != 0:
-                    links = col[1].find_all('a')
-                    if links:
-                        # Extracting and cleaning bank names
-                        bank_name = links[0].text.strip()
-                        
-                        # Replacing commas to prevent float conversion exceptions
-                        raw_market_cap = col[2].text.strip().replace(',', '')
-                        
-                        # Appending the parsed records into the staging dataframe
-                        new_row = pd.DataFrame([{"Name": bank_name, "MC_USD_Billion": raw_market_cap}])
-                        df = pd.concat([df, new_row], ignore_index=True)
-                        
-            # Safe parsing to numeric values; malformed tokens are coerced to NaN
-            df['MC_USD_Billion'] = pd.to_numeric(df['MC_USD_Billion'], errors='coerce')
+            # Find the target Market Cap table
+            target_df = None
+            for table in all_tables:
+                columns_joined = "".join(table.columns.astype(str)).lower()
+                if 'market cap' in columns_joined or 'market capitalization' in columns_joined:
+                    target_df = table
+                    break
             
-            # Dropping corrupted records to ensure database schema integrity
-            df = df.dropna(subset=['MC_USD_Billion'])
-            return df
+            # If search fails, fallback to the standard second table index
+            if target_df is None and len(all_tables) > 1:
+                target_df = all_tables[1]
             
+            if target_df is not None:
+                # Dynamically locate the correct column index for Bank Name and Market Cap
+                name_col = [col for col in target_df.columns if 'bank' in str(col).lower() or 'name' in str(col).lower()][0]
+                cap_col = [col for col in target_df.columns if 'market cap' in str(col).lower() or 'usd' in str(col).lower() or 'billion' in str(col).lower()][0]
+                
+                # Create a clean slice
+                df = target_df[[name_col, cap_col]].copy()
+                df.columns = table_attribs
+                
+                # Sanitize text formatting and force numeric types
+                df['Name'] = df['Name'].astype(str).str.strip()
+                df['MC_USD_Billion'] = df['MC_USD_Billion'].astype(str).str.replace(',', '')
+                df['MC_USD_Billion'] = pd.to_numeric(df['MC_USD_Billion'], errors='coerce')
+                
+                # Filter out empty or corrupted records
+                df = df.dropna(subset=['MC_USD_Billion', 'Name'])
+                df = df[df['Name'] != '']
+                
+                return df.reset_index(drop=True)
+                
     except Exception as e:
-        # Documenting infrastructure errors without halting execution flow
-        log_progress(f"Live extraction failed due to: {str(e)}. Switching to stable backup array.")
+        log_progress(f"Live extraction failed: {str(e)}. Switching to backup array.")
         pass
         
-    # High-availability Fallback Array to secure pipeline continuity
     backup_data = [
         {"Name": "JPMorgan Chase", "MC_USD_Billion": 432.92},
         {"Name": "Bank of America", "MC_USD_Billion": 231.52},
@@ -101,16 +102,13 @@ def extract(url, table_attribs):
 # ==========================================
 def transform(df, csv_path):
     ''' Computes currency conversions (GBP, EUR, INR) using the live exchange reference. '''
-    # Parsing the currency mapping file
     dataframe = pd.read_csv(csv_path)
     exchange_rate = dataframe.set_index('Currency').to_dict()['Rate']
 
-    # Casting structural parameters to floats
     gbp_rate = float(exchange_rate['GBP'])
     eur_rate = float(exchange_rate['EUR'])
     inr_rate = float(exchange_rate['INR'])
     
-    # Vectorized operations scaled and rounded to 2 decimal places
     df['MC_GBP_Billion'] = [np.round(x * gbp_rate, 2) for x in df['MC_USD_Billion']]
     df['MC_EUR_Billion'] = [np.round(x * eur_rate, 2) for x in df['MC_USD_Billion']]
     df['MC_INR_Billion'] = [np.round(x * inr_rate, 2) for x in df['MC_USD_Billion']]
@@ -121,15 +119,12 @@ def transform(df, csv_path):
 # Tasks 4, 5 & 6: Data Loading & Query Verification
 # ==========================================
 def load_to_csv(df, output_path):
-    ''' Persists the finalized DataFrame to a local flat CSV file. '''
     df.to_csv(output_path, index = False)
 
 def load_to_db(df, sql_connection, table_name):
-    ''' Writes the consolidated DataFrame to a target SQLite database table. '''
     df.to_sql(table_name, sql_connection, if_exists = 'replace', index = False)
 
 def run_query(query_statement, sql_connection):
-    ''' Executes ad-hoc SQL statements and displays outputs on the system terminal. '''
     print(f"\nQuery Statement: {query_statement}")
     sql_file = pd.read_sql(query_statement, sql_connection)
     print(sql_file)
@@ -139,32 +134,26 @@ def run_query(query_statement, sql_connection):
 # ==========================================================
 log_progress('Preliminaries complete. Initiating LIVE ETL process')
 
-# Phase 1: Dynamic Data Extraction
 df_extracted = extract(url, table_attribs)
 log_progress('Data extraction complete. Initiating Transformation process')
 
-# Phase 2: Currency Transformation Engine
 df_transformed = transform(df_extracted, exchange_csv_path)
 log_progress('Data transformation complete. Initiating Loading process')
 
-# Phase 3: Flat-File Staging (CSV File Generation)
 load_to_csv(df_transformed, csv_path)
 log_progress('Data saved to CSV file')
 
-# Phase 4: Database Ingestion (RDBMS SQLite Initialization)
 sql_connection = sqlite3.connect(db_name)
 log_progress('SQL Connection initiated')
 
-# Loading records to SQLite Engine
 load_to_db(df_transformed, sql_connection, table_name)
 log_progress('Data loaded to Database as a table, Executing queries')
 
-# Phase 5: Executing Verification Audits on Fresh Live Records
-run_query(f"SELECT * FROM {table_name}", sql_connection)
+# Verification Audits
+run_query(f"SELECT * FROM {table_name} LIMIT 5", sql_connection)
 run_query(f"SELECT AVG(MC_GBP_Billion) FROM {table_name}", sql_connection)
 run_query(f"SELECT Name FROM {table_name} LIMIT 5", sql_connection)
 
-# Phase 6: Connection Dismantling & Finalizing Pipeline
 log_progress('Process Complete Successfully')
 sql_connection.close()
 log_progress('Server Connection closed')
